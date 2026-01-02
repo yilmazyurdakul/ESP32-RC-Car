@@ -1,4 +1,4 @@
- SmartGarage – ESP32 Web-Controlled RC Platform
+SP32 Web-Controlled RC Platform
 
 This is an **ESP32-based Wi-Fi controlled vehicle firmware** featuring real-time WebSocket control, servo steering, PWM motor drive, lighting logic, battery monitoring, OTA firmware updates, and built-in safety mechanisms.
 
