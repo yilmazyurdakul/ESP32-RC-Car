@@ -3,7 +3,6 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <ESP32Servo.h>
-#include <SPIFFS.h>
 #include <Update.h>
 
 #include "webpage.h"  // HTML UI
@@ -55,11 +54,13 @@ bool headlightsOn = false;
 bool tailManualOn = false;
 
 bool brakeActive = false;
-unsigned long brakeEndTime = 0;
+unsigned long brakeStartTime = 0;
+const unsigned long brakeDuration = 2000;
 
 // FAILSAFE
 unsigned long lastControlTime = 0;
 const unsigned long controlTimeout = 200;  // stop only if REAL loss
+bool failsafeTriggered = false;
 
 const uint8_t TAIL_DIM_LEVEL = 100;
 
@@ -67,6 +68,8 @@ const uint8_t TAIL_DIM_LEVEL = 100;
 bool otaInProgress = false;
 unsigned long otaBlinkTimer = 0;
 bool otaBlinkState = false;
+unsigned long lastOtaChunkTime = 0;
+const unsigned long otaStallTimeout = 10000;  // abort upload if no data for 10s
 
 // WebSocket manual ping
 unsigned long lastPingSent = 0;
@@ -83,8 +86,14 @@ AsyncWebSocket ws("/ws");
 
 // ============================================================
 // BATTERY MEASUREMENT
-// 1400 raw = 8.4V full
+// ADC calibration: 1400 raw (12-bit, 11 dB attenuation) = 8.4 V
+// at the ADC pin via the on-board voltage divider (2S Li-Ion).
 // ============================================================
+
+const float VIN_FULLSCALE_RAW = 1400.0f;
+const float VIN_FULLSCALE_V = 8.4f;
+const float VIN_MIN_V = 4.0f;  // 2S empty
+const float VIN_MAX_V = 8.4f;  // 2S full
 
 float readVinAveraged(uint8_t samples = 20) {
   uint32_t sum = 0;
@@ -94,14 +103,13 @@ float readVinAveraged(uint8_t samples = 20) {
   }
 
   float raw = sum / (float)samples;
-  float vin = raw * (8.4f / 1400.0f);
+  float vin = raw * (VIN_FULLSCALE_V / VIN_FULLSCALE_RAW);
   return vin;
 }
 
-float getBatteryPercent() {
-  float vin = readVinAveraged();
-  vin = constrain(vin, 4.0f, 8.4f);
-  float pct = ((vin - 4.0f) / (8.4f - 4.0f)) * 100.0f;
+float getBatteryPercent(float vin) {
+  vin = constrain(vin, VIN_MIN_V, VIN_MAX_V);
+  float pct = ((vin - VIN_MIN_V) / (VIN_MAX_V - VIN_MIN_V)) * 100.0f;
   return constrain(pct, 0.0f, 100.0f);
 }
 
@@ -122,12 +130,12 @@ void updateTailLightState() {
   unsigned long now = millis();
 
   // Timed brake
-  if (brakeActive && now < brakeEndTime) {
+  if (brakeActive && now - brakeStartTime < brakeDuration) {
     setTailPWM(255);
     return;
   }
 
-  if (brakeActive && now >= brakeEndTime) {
+  if (brakeActive) {
     brakeActive = false;
   }
 
@@ -153,6 +161,13 @@ void updateTailLightState() {
 void stopMotor() {
   ledcWrite(pwmChannelFWD, 0);
   ledcWrite(pwmChannelBWD, 0);
+}
+
+void applyBrake() {
+  stopMotor();
+  currentThrottle = 0;
+  brakeActive = true;
+  brakeStartTime = millis();
 }
 
 void forwardMotor(int speed) {
@@ -185,7 +200,7 @@ void handleJoy(int steer, int throttle) {
   // Brake trigger
   if (currentThrottle != 0 && throttle == 0) {
     brakeActive = true;
-    brakeEndTime = millis() + 2000;
+    brakeStartTime = millis();
   }
 
   currentThrottle = throttle;
@@ -209,13 +224,14 @@ void handleJoy(int steer, int throttle) {
 
 void handleCommand(const String &cmd) {
 
+  lastControlTime = millis();
+  failsafeTriggered = false;
+
   // Heartbeat
   if (cmd == "ALIVE") {
-    lastControlTime = millis();
     return;
   }
 
-  lastControlTime = millis();
   Serial.println(cmd);
 
   if (cmd.startsWith("JOY:")) {
@@ -267,15 +283,17 @@ void onWsEvent(
   size_t len)
 {
   if (type == WS_EVT_DATA) {
-    String msg = String((char *)data).substring(0, len);
-    handleCommand(msg);
+    AwsFrameInfo *info = (AwsFrameInfo *)arg;
+    if (info->opcode == WS_TEXT) {
+      String msg((char *)data, len);
+      handleCommand(msg);
+    }
   }
 
   if (type == WS_EVT_DISCONNECT) {
-    // Hard disconnect: stop throttle immediately
-    stopMotor();
-    currentThrottle = 0;
-    brakeActive = false;
+    // Hard disconnect: apply timed brake
+    failsafeTriggered = true;
+    applyBrake();
     updateTailLightState();
   }
 }
@@ -343,10 +361,21 @@ void setupOTA() {
         otaInProgress = true;
         otaBlinkTimer = millis();
         otaBlinkState = false;
+        lastOtaChunkTime = millis();
+
+        // Abort cleanly if the client drops mid-upload
+        req->onDisconnect([]() {
+          if (otaInProgress) {
+            otaInProgress = false;
+            Update.abort();
+          }
+        });
+
         Serial.printf("OTA Start: %s\n", filename.c_str());
-        Update.begin();
+        Update.begin(UPDATE_SIZE_UNKNOWN);
       }
 
+      lastOtaChunkTime = millis();
       Update.write(data, len);
 
       if (final) {
@@ -383,8 +412,6 @@ void setup() {
   analogReadResolution(12);
   analogSetPinAttenuation(vinPin, ADC_11db);
 
-  SPIFFS.begin(true);
-
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ssid, pass);
 
@@ -394,7 +421,7 @@ void setup() {
 
   server.on("/vin", HTTP_GET, [](AsyncWebServerRequest *req) {
     float vin = readVinAveraged();
-    float pct = getBatteryPercent();
+    float pct = getBatteryPercent(vin);
     String json = "{";
     json += "\"voltage\":" + String(vin, 2) + ",";
     json += "\"percent\":" + String(pct, 0);
@@ -421,17 +448,25 @@ void loop() {
   ws.cleanupClients();
   otaBlinkLoop();
 
-  // Manual WebSocket ping every 5 seconds to keep connection alive
-  if (millis() - lastPingSent > 5000) {
-    lastPingSent = millis();
-    ws.textAll("PING");
+  // OTA watchdog: abort if upload stalls (client gone without clean close)
+  if (otaInProgress && millis() - lastOtaChunkTime > otaStallTimeout) {
+    otaInProgress = false;
+    Update.abort();
+    updateTailLightState();
   }
 
-  // FAILSAFE: stop ONLY motor (NOT steering)
+  // Keep the WebSocket alive with a protocol-level ping every 5 seconds
+  if (millis() - lastPingSent > 5000) {
+    lastPingSent = millis();
+    ws.pingAll();
+  }
+
+  // FAILSAFE: apply timed brake on signal loss
   if (millis() - lastControlTime > controlTimeout) {
-    stopMotor();
-    currentThrottle = 0;
-    brakeActive = false;
+    if (!failsafeTriggered) {
+      failsafeTriggered = true;
+      applyBrake();
+    }
     updateTailLightState();
   }
 }

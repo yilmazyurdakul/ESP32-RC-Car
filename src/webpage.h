@@ -158,10 +158,10 @@ const char webpageHTML[] PROGMEM = R"HTML(
        oninput="send('MAXPOWER:'+this.value)">
 
 <div class="section-title">Lights</div>
-<button class="btn" onclick="send('HEAD_ON')">Low Beam</button>
+<button class="btn" onclick="setLowBeam()">Low Beam</button>
 <button class="btn" onclick="flashHighBeam()">Flash High Beam</button>
-<button class="btn" onclick="send('HEAD_HIGH')">High Beam</button>
-<button class="btn" onclick="send('HEAD_OFF')">Lights OFF</button>
+<button class="btn" onclick="setHighBeam()">High Beam</button>
+<button class="btn" onclick="lightsOff()">Lights OFF</button>
 
 
 <script>
@@ -205,15 +205,33 @@ setInterval(() => {
 
 
 // ============================================================
-// HIGH BEAM FLASH
+// LIGHT STATE + HIGH BEAM FLASH
 // ============================================================
+let lightsOn = false;
+
+function setLowBeam() {
+  send("HEAD_ON");
+  lightsOn = true;
+}
+
+function setHighBeam() {
+  send("HEAD_HIGH");
+  lightsOn = true;
+}
+
+function lightsOff() {
+  send("HEAD_OFF");
+  lightsOn = false;
+}
+
 function flashHighBeam() {
+  const restore = lightsOn;
   send("HEAD_HIGH");
   setTimeout(()=>send("HEAD_ON"), 180);
   setTimeout(()=>send("HEAD_HIGH"), 350);
   setTimeout(()=>send("HEAD_ON"), 520);
   setTimeout(()=>send("HEAD_HIGH"), 700);
-  setTimeout(()=>send("HEAD_ON"), 950);
+  setTimeout(()=>send(restore ? "HEAD_ON" : "HEAD_OFF"), 950);
 }
 
 
@@ -304,6 +322,7 @@ function handleMove(clientX, clientY){
 joy.addEventListener('pointerdown', e => {
   dragging=true;
   stick.style.transition="0s";
+  joy.setPointerCapture(e.pointerId);
   handleMove(e.clientX, e.clientY);
 });
 
